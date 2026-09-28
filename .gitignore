@@ -1,0 +1,12 @@
+*.exe
+*.o
+*.obj
+*.out
+*.dbce
+*.dbce.wal
+*.dbce.lock
+.vscode/
+.idea/
+*.swp
+*.swo
+*.dSYM/

@@ -1,0 +1,6 @@
+{
+  "db_path": "data.dbce",
+  "queue_size": 2048,
+  "sync_interval_ms": 100,
+  "lang":"tr"
+}
