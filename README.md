@@ -4,13 +4,13 @@
 gcc -Wall -Wextra -O2 main.c dbce.c -o dbce.exe -lpthread
 
 ## CLI
-.\dbce.exe create db users
-.\dbce.exe db list
-.\dbce.exe add users id:1 '{"name":"Alper"}'
-.\dbce.exe get users id:1
-.\dbce.exe get users table
-.\dbce.exe del users id:1
-.\dbce.exe go users
+.\dbce.exe create db users  
+.\dbce.exe db list  
+.\dbce.exe add users id:1 '{"name":"Alper"}'  
+.\dbce.exe get users id:1  
+.\dbce.exe get users table  
+.\dbce.exe del users id:1  
+.\dbce.exe go users  
 
 ## REPL
 add id:1 {"name":"Alper"}
