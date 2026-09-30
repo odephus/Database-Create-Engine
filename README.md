@@ -21,9 +21,9 @@ cls
 exit
 
 ## Config (config.json)
-{
-  "db_path": "data.dbce",
-  "queue_size": 2048,
-  "sync_interval_ms": 100,
-  "lang": "tr"
-}
+{  
+  "db_path": "data.dbce",  
+  "queue_size": 2048,  
+  "sync_interval_ms": 100,  
+  "lang": "tr"  
+}  
