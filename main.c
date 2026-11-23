@@ -5,6 +5,7 @@
 #include "dbce.h"
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #ifdef _WIN32
 #include "windows.h"
@@ -46,6 +47,7 @@ static void load_lang_config() {
 }
 
 static void show_cli_help() {
+    puts("dbce migrate SOURCE DEST\ndbce recover SOURCE [DEST]");
     if (current_lang == LANG_TR) {
         printf("\n================ [ DBCE Komut Kilavuzu ] ================\n\n");
         printf("[ Terminal (CLI) Komutlari ]:\n");
@@ -214,6 +216,15 @@ static void report_error(const char* operation, const char* key) {
         fprintf(stderr, "%s: %s (%s)\n", operation,
                 current_lang == LANG_TR ? "Anahtar bulunamadi" : "Key not found", key);
         return;
+    case EBADMSG:
+        message = current_lang == LANG_TR ? "CRC32 dogrulama hatasi" : "CRC32 verification failed";
+        break;
+    case EBUSY:
+        message = current_lang == LANG_TR ? "Veritabani kullanimda" : "Database is already open";
+        break;
+    case ENOTSUP:
+        message = current_lang == LANG_TR ? "Desteklenmeyen bicim veya islem" : "Unsupported format or operation";
+        break;
     case EILSEQ:
         message = current_lang == LANG_TR ? "Gecersiz veya eksik DBCE kaydi" :
                                            "Invalid or incomplete DBCE record";
@@ -288,7 +299,8 @@ static bool run_repl(dbce_t* db, const char* target) {
         if (strcmp(cmd, "cls") == 0 || strcmp(cmd, "clear") == 0) { clear_screen(); continue; }
         bool success;
         if (strcmp(cmd, "add") == 0) {
-            success = dbce_set(db, key, value, strlen(value));
+            if (!*key || !*value) { errno = EINVAL; success = false; }
+            else success = dbce_set(db, key, value, strlen(value));
             if (success) printf("[OK] %s -> %s\n", current_lang == LANG_TR ? "Eklendi" : "Added", key);
         } else if (strcmp(cmd, "get") == 0) {
             success = show_value(db, key);
@@ -317,6 +329,26 @@ int main(int argc, char* argv[]) {
     }
 
     const char* cmd = argv[1];
+    if (!strcmp(cmd, "migrate") && argc == 4) {
+        if (dbce_migrate(argv[2], argv[3])) { puts("[OK]"); return 0; }
+        report_error(cmd, NULL);
+        return 1;
+    }
+    if (!strcmp(cmd, "recover") && (argc == 3 || argc == 4)) {
+        dbce_recovery_t report = {0};
+        if (!dbce_recover(argv[2], argc == 4 ? argv[3] : NULL, &report)) {
+            report_error(cmd, NULL);
+            if (report.issue) {
+                const char* issues[] = {"none", "file_header", "magic", "version", "operation",
+                                        "reserved_fields", "length", "key", "header_crc", "record_crc"};
+                fprintf(stderr, "issue=%s offset=%" PRIu64 "\n", issues[report.issue], report.verified_bytes);
+            }
+            return 1;
+        }
+        const char* parts[] = {"clean", "header", "key", "value"};
+        printf("tail=%s discarded_bytes=%" PRIu64 "\n", parts[report.tail], report.discarded_bytes);
+        return 0;
+    }
     if (argc >= 3 && strcmp(cmd, "db") == 0 && strcmp(argv[2], "list") == 0) {
         if (list_databases()) return 0;
         perror("db list");

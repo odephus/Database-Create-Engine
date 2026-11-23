@@ -1,6 +1,6 @@
 #define _FILE_OFFSET_BITS 64
 #define _POSIX_C_SOURCE 200809L
-#include "dbce.h"
+#include "storage_format.h"
 #include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -9,13 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#define file_seek _fseeki64
-#define file_tell _ftelli64
-#else
-#define file_seek fseeko
-#define file_tell ftello
-#endif
 
 #define DEFAULT_QUEUE_SIZE 1024
 _Static_assert(sizeof(dbce_record_header_t) == 16, "legacy header layout");
@@ -24,22 +17,25 @@ typedef struct {
     char key[DBCE_MAX_KEY + 1];
     int64_t file_offset;
     uint32_t val_len;
+    bool present;
 } index_entry_t;
 
 typedef struct {
     char key[DBCE_MAX_KEY + 1];
     void* val;
     uint32_t val_len;
+    unsigned char op;
     uint64_t sequence;
     int* result;  /* Synchronous submitter's stack, protected by q_mutex. */
 } write_task_t;
 
 struct dbce_engine {
     FILE* fp;
+    bool v2;
     index_entry_t index[DBCE_INDEX_CAPACITY];
     size_t index_count;
     pthread_mutex_t storage_mutex;
-    int append_error;
+    int append_error, durable_error;
 
     write_task_t* queue;
     size_t q_capacity, q_head, q_tail, q_count;
@@ -54,6 +50,7 @@ struct dbce_engine {
 /* Tests supply deterministic worker and I/O fault points in their own build. */
 #ifdef DBCE_TESTING
 static int before_worker_create(void);
+static int sync_failure;
 static void after_dequeue(void);
 static int after_header_write(void);
 static void before_barrier_wait(void);
@@ -65,9 +62,6 @@ static bool fail(int error) {
     return false;
 }
 
-static int io_error(void) {
-    return errno ? errno : EIO;
-}
 
 static bool valid_key(const char* key) {
     if (!key || !*key) return fail(EINVAL);
@@ -87,13 +81,14 @@ static index_entry_t* find_index_internal(dbce_t* db, const char* key) {
 }
 
 static void publish(dbce_t* db, index_entry_t* entry, const char* key,
-                    int64_t offset, uint32_t len) {
+                    int64_t offset, uint32_t len, bool present) {
     if (!entry) {
         entry = &db->index[db->index_count++];
         strcpy(entry->key, key);
     }
     entry->file_offset = offset;
     entry->val_len = len;
+    entry->present = present;
 }
 
 /* Called only under storage_mutex. A failed append seals the file for this handle. */
@@ -102,24 +97,33 @@ static int internal_append(dbce_t* db, const write_task_t* task) {
     index_entry_t* entry = find_index_internal(db, task->key);
     if (!entry && db->index_count == DBCE_INDEX_CAPACITY) return ENOSPC;
     dbce_record_header_t h = {DBCE_MAGIC, 0, (uint32_t)strlen(task->key), task->val_len};
+    unsigned char wire[V2_RECORD_BYTES];
+    const void* header = &h;
+    size_t header_size = sizeof(h);
+    if (db->v2) {
+        uint32_t crc = dbce_v2_prefix(wire, task->op, task->key, h.val_len);
+        dbce_v2_finish_header(wire, dbce_crc32_update(crc, task->val, h.val_len));
+        header = wire;
+        header_size = sizeof(wire);
+    }
     errno = 0;
     if (file_seek(db->fp, 0, SEEK_END) != 0) goto io_failure;
     int64_t start = file_tell(db->fp);
     if (start < 0) goto io_failure;
-    int64_t prefix = (int64_t)sizeof(h) + h.key_len;
+    int64_t prefix = (int64_t)header_size + h.key_len;
     if (start > INT64_MAX - prefix - h.val_len) return EFBIG;
-    if (fwrite(&h, 1, sizeof(h), db->fp) != sizeof(h)) goto io_failure;
+    if (dbce_write_exact(db->fp, header, header_size)) goto io_failure;
 #ifdef DBCE_TESTING
     if ((errno = after_header_write()) != 0) goto io_failure;
 #endif
     if (fwrite(task->key, 1, h.key_len, db->fp) != h.key_len ||
         (h.val_len && fwrite(task->val, 1, h.val_len, db->fp) != h.val_len) ||
         fflush(db->fp) != 0 || ferror(db->fp)) goto io_failure;
-    publish(db, entry, task->key, start + prefix, h.val_len);
+    publish(db, entry, task->key, start + prefix, h.val_len, task->op == OP_SET);
     return 0;
 
 io_failure:
-    db->append_error = io_error();
+    db->append_error = dbce_io_error();
     clearerr(db->fp);  /* Existing committed records remain readable. */
     return db->append_error;
 }
@@ -159,39 +163,35 @@ static void* writer_worker(void* arg) {
     return NULL;
 }
 
-static int read_exact(FILE* fp, void* buf, size_t count) {
-    errno = 0;
-    if (fread(buf, 1, count, fp) == count) return 0;
-    return ferror(fp) ? io_error() : EILSEQ;
+static int index_record(const log_record* rec, void* arg) {
+    dbce_t* db = arg;
+    index_entry_t* entry = find_index_internal(db, rec->key);
+    if (!entry && db->index_count == DBCE_INDEX_CAPACITY) return ENOSPC;
+    publish(db, entry, rec->key, rec->offset, rec->length, rec->op == OP_SET);
+    return 0;
 }
 
-static int load_index(dbce_t* db) {
-    if (file_seek(db->fp, 0, SEEK_END) != 0) return io_error();
-    int64_t end = file_tell(db->fp);
-    if (end < 0 || file_seek(db->fp, 0, SEEK_SET) != 0) return io_error();
-    int64_t pos = 0;
-    while (pos < end) {
-        dbce_record_header_t h;
-        if (end - pos < (int64_t)sizeof(h)) return EILSEQ;
-        int error = read_exact(db->fp, &h, sizeof(h));
-        if (error) return error;
-        pos += (int64_t)sizeof(h);
-        if (h.magic != DBCE_MAGIC || !h.key_len || h.key_len > DBCE_MAX_KEY ||
-            (int64_t)h.key_len + h.val_len > end - pos) return EILSEQ;
-        if (!value_fits(h.val_len)) return EOVERFLOW;
-        char key[DBCE_MAX_KEY + 1];
-        error = read_exact(db->fp, key, h.key_len);
-        if (error) return error;
-        if (memchr(key, '\0', h.key_len)) return EILSEQ;
-        key[h.key_len] = '\0';
-        pos += h.key_len;
-        index_entry_t* entry = find_index_internal(db, key);
-        if (!entry && db->index_count == DBCE_INDEX_CAPACITY) return ENOSPC;
-        if (file_seek(db->fp, pos + h.val_len, SEEK_SET) != 0) return io_error();
-        publish(db, entry, key, pos, h.val_len);
-        pos += h.val_len;
-    }
-    return 0;
+int dbce_validate_log(FILE* fp, log_info* info) {
+    dbce_t* scratch = calloc(1, sizeof(*scratch));
+    if (!scratch) return ENOMEM;
+    int error = dbce_walk_log(fp, info, index_record, scratch);
+    free(scratch);
+    return error;
+}
+
+/* Publish a fully initialized, locked header. A pre-existing empty file is V1. */
+static FILE* open_database(const char* path) {
+    FILE* fp = dbce_locked_existing(path, true);
+    if (fp || errno != ENOENT) return fp;
+    stage_t stage = {0};
+    int error = dbce_stage_create(&stage, path);
+    if (!error) error = dbce_write_v2_file_header(stage.fp);
+    if (!error) error = dbce_stage_publish(&stage, path);
+    if (!error) return stage.fp;
+    dbce_stage_finish(&stage, error);
+    if (error == EEXIST) return dbce_locked_existing(path, true);
+    errno = error;
+    return NULL;
 }
 
 static dbce_t* dbce_init_engine(const char* filepath, size_t queue_size) {
@@ -203,11 +203,11 @@ static dbce_t* dbce_init_engine(const char* filepath, size_t queue_size) {
     db->q_capacity = queue_size;
     db->queue = calloc(queue_size, sizeof(*db->queue));
     if (!db->queue) goto free_engine;
-    db->fp = fopen(filepath, "a+b");
-    if (!db->fp) { error = io_error(); goto free_queue; }
-    /* Prevent a later seek or close retrying bytes left buffered after a failure. */
-    if (setvbuf(db->fp, NULL, _IONBF, 0) != 0) { error = EIO; goto close_file; }
-    error = load_index(db);
+    db->fp = open_database(filepath);
+    if (!db->fp) { error = dbce_io_error(); goto free_queue; }
+    log_info info;
+    error = dbce_walk_log(db->fp, &info, index_record, db);
+    db->v2 = info.v2;
     if (error) goto close_file;
     error = pthread_mutex_init(&db->storage_mutex, NULL);
     if (error) goto close_file;
@@ -284,14 +284,14 @@ dbce_t* dbce_open_config(const char* config_path) {
             cfg.queue_size = n ? (size_t)n : DEFAULT_QUEUE_SIZE;
         }
     }
-    if (ferror(fp) && !error) error = io_error();
-    if (fclose(fp) != 0 && !error) error = io_error();
+    if (ferror(fp) && !error) error = dbce_io_error();
+    if (fclose(fp) != 0 && !error) error = dbce_io_error();
     if (error) { errno = error; return NULL; }
     return dbce_init_engine(cfg.db_path, cfg.queue_size);
 }
 
 /* q_mutex is held from admission through publication of the queue slot. */
-static int enqueue(dbce_t* db, const char* key, const void* val, size_t len, int* result) {
+static int enqueue(dbce_t* db, const char* key, const void* val, size_t len, unsigned char op, int* result) {
     if (!db->running) return ECANCELED;
     if (db->writer_error) return db->writer_error;
     if (db->q_count == db->q_capacity) return EAGAIN;
@@ -303,6 +303,7 @@ static int enqueue(dbce_t* db, const char* key, const void* val, size_t len, int
     if (len) memcpy(task->val, val, len);
     strcpy(task->key, key);
     task->val_len = (uint32_t)len;
+    task->op = op;
     task->result = result;
     task->sequence = ++db->submitted;
     db->q_tail = (db->q_tail + 1) % db->q_capacity;
@@ -311,13 +312,14 @@ static int enqueue(dbce_t* db, const char* key, const void* val, size_t len, int
     return 0;
 }
 
-static bool submit(dbce_t* db, const char* key, const void* val, size_t len, bool wait) {
+static bool submit(dbce_t* db, const char* key, const void* val, size_t len, unsigned char op, bool wait) {
     if (!db) return fail(EINVAL);
     if (!valid_key(key)) return false;
+    if (op == OP_SET && ((!val && len) || (!len && !db->v2))) return fail(EINVAL);
     if (!value_fits(len)) return fail(EOVERFLOW);
     int result = 0;
     pthread_mutex_lock(&db->q_mutex);
-    int error = enqueue(db, key, val, len, wait ? &result : NULL);
+    int error = enqueue(db, key, val, len, op, wait ? &result : NULL);
     uint64_t seq = db->submitted;
     while (!error && wait && db->completed < seq)
         pthread_cond_wait(&db->completion, &db->q_mutex);
@@ -327,17 +329,15 @@ static bool submit(dbce_t* db, const char* key, const void* val, size_t len, boo
 }
 
 bool dbce_set_async(dbce_t* db, const char* key, const void* val, size_t len) {
-    if (!val || !len) return fail(EINVAL);
-    return submit(db, key, val, len, false);
+    return submit(db, key, val, len, OP_SET, false);
 }
 
 bool dbce_set(dbce_t* db, const char* key, const void* val, size_t len) {
-    if (!val || !len) return fail(EINVAL);
-    return submit(db, key, val, len, true);
+    return submit(db, key, val, len, OP_SET, true);
 }
 
 bool dbce_del(dbce_t* db, const char* key) {
-    return submit(db, key, NULL, 0, true);
+    return submit(db, key, NULL, 0, OP_DELETE, true);
 }
 
 bool dbce_sync_wait_checked(dbce_t* db) {
@@ -359,13 +359,26 @@ void dbce_sync_wait(dbce_t* db) {
     (void)dbce_sync_wait_checked(db);
 }
 
+bool dbce_sync_durable(dbce_t* db) {
+    if (!dbce_sync_wait_checked(db)) return false;
+    pthread_mutex_lock(&db->storage_mutex);
+    int error = db->durable_error ? db->durable_error : db->append_error;
+#ifdef DBCE_TESTING
+    if (!error) error = sync_failure;
+#endif
+    if (!error) error = dbce_disk_sync(db->fp);
+    db->durable_error = error;
+    pthread_mutex_unlock(&db->storage_mutex);
+    return error ? fail(error) : true;
+}
+
 static int read_value(dbce_t* db, const index_entry_t* entry, void** out) {
     size_t n = entry->val_len;
     char* buf = malloc(n + 1);
     if (!buf) return ENOMEM;
     int error = 0;
-    if (file_seek(db->fp, entry->file_offset, SEEK_SET) != 0) error = io_error();
-    else error = read_exact(db->fp, buf, n);
+    if (file_seek(db->fp, entry->file_offset, SEEK_SET) != 0) error = dbce_io_error();
+    else error = dbce_read_exact(db->fp, buf, n);
     if (error) { free(buf); return error; }
     buf[n] = '\0';
     *out = buf;
@@ -380,7 +393,7 @@ bool dbce_get(dbce_t* db, const char* key, void** out_val, size_t* out_len) {
     pthread_mutex_lock(&db->storage_mutex);
     index_entry_t* entry = find_index_internal(db, key);
     int error = ENOENT;
-    if (entry && entry->val_len) {
+    if (entry && entry->present) {
         error = read_value(db, entry, out_val);
         if (!error) *out_len = entry->val_len;
     }
@@ -390,7 +403,7 @@ bool dbce_get(dbce_t* db, const char* key, void** out_val, size_t* out_len) {
 
 bool dbce_scan_all_checked(dbce_t* db, dbce_scan_cb cb, void* udata) {
     if (!db || !cb) return fail(EINVAL);
-    dbce_sync_wait(db);
+    if (!dbce_sync_wait_checked(db)) return false;
     /* Old offsets remain valid for the lifetime of the append-only log. */
     pthread_mutex_lock(&db->storage_mutex);
     size_t count = db->index_count;
@@ -400,7 +413,7 @@ bool dbce_scan_all_checked(dbce_t* db, dbce_scan_cb cb, void* udata) {
     if (count && !snapshot) return fail(ENOMEM);
     int error = 0;
     for (size_t i = 0; i < count; ++i) {
-        if (!snapshot[i].val_len) continue;
+        if (!snapshot[i].present) continue;
         void* buf = NULL;
         pthread_mutex_lock(&db->storage_mutex);
         error = read_value(db, &snapshot[i], &buf);
@@ -428,8 +441,8 @@ bool dbce_close_checked(dbce_t* db) {
     pthread_mutex_unlock(&db->q_mutex);
     int error = pthread_join(db->writer_thread, NULL);
     if (error) return fail(error);  /* Cannot release a possibly live worker. */
-    error = db->first_error;
-    if (fclose(db->fp) != 0 && !error) error = io_error();
+    error = db->first_error ? db->first_error : db->durable_error;
+    if (fclose(db->fp) != 0 && !error) error = dbce_io_error();
     pthread_cond_destroy(&db->completion);
     pthread_cond_destroy(&db->q_not_empty);
     pthread_mutex_destroy(&db->q_mutex);

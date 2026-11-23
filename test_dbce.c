@@ -1,10 +1,12 @@
 /* Compile the engine into this test translation unit to inject private faults. */
-#define DBCE_TESTING
 #include "dbce.c"
 #ifdef _WIN32
 #include <windows.h>
+#include <process.h>
 #else
 #include <unistd.h>
+#include <sys/wait.h>
+#include <dirent.h>
 #include <signal.h>
 #include <sys/resource.h>
 #endif
@@ -469,14 +471,300 @@ static void drain(void) {
     CHECK(dbce_close_checked(db));
 }
 
-int main(void) {
+
+/* Independent wire fixture: SET a=00ff10, SET e="", DELETE a. */
+static const unsigned char golden[] = {
+    137,68,66,50,13,10,26,10,2,0,16,0,0,0,0,0,
+    68,82,50,33,1,0,0,0,1,0,0,0,3,0,0,0,110,208,65,55,85,195,231,61,97,0,255,16,
+    68,82,50,33,1,0,0,0,1,0,0,0,0,0,0,0,126,143,39,107,90,43,235,213,101,
+    68,82,50,33,2,0,0,0,1,0,0,0,0,0,0,0,169,39,128,209,236,98,57,90,97
+};
+
+static void fixture(const char* name, const void* bytes, size_t len) {
+    FILE* f = fopen(name, "wb");
+    CHECK(f);
+    put_bytes(f, bytes, len);
+    CHECK(!fclose(f));
+}
+
+static void expect_file(const char* name, const unsigned char* expected, size_t n) {
+    unsigned char bytes[256];
+    CHECK(n < sizeof(bytes));
+    FILE* fp = fopen(name, "rb");
+    CHECK(fp && fread(bytes, 1, sizeof(bytes), fp) == n && !ferror(fp));
+    CHECK(!memcmp(bytes, expected, n) && !fclose(fp));
+}
+
+static void empty_row(const char* key, const void* val, size_t n, void* arg) {
+    CHECK(!strcmp(key, "e") && val && !n);
+    ++*(int*)arg;
+}
+
+static void wire(void) {
+    CHECK(dbce_crc32_update(0, NULL, 0) == 0);
+    CHECK(dbce_crc32_update(0, "123456789", 9) == UINT32_C(0xcbf43926));
+    CHECK(dbce_crc32_update(dbce_crc32_update(0, "1234", 4), "56789", 5) == UINT32_C(0xcbf43926));
+    CHECK(!remove(path)); /* A missing pathname creates V2. */
+    dbce_t* db = open_temp();
+    const unsigned char value[] = {0,255,16};
+    CHECK(dbce_set(db, "a", value, sizeof(value)));
+    CHECK(dbce_set_async(db, "e", NULL, 0));
+    CHECK(dbce_sync_durable(db));
+    CHECK(dbce_close_checked(db));
+    db = open_temp();
+    expect_value(db, "a", value, sizeof(value));
+    expect_value(db, "e", "", 0);
+    CHECK(dbce_del(db, "a"));
+    missing(db, "a");
+    CHECK(dbce_close_checked(db));
+    expect_file(path, golden, sizeof(golden));
+    db = open_temp();
+    int seen = 0;
+    CHECK(dbce_scan_all_checked(db, empty_row, &seen) && seen == 1);
+    CHECK(dbce_close_checked(db));
+}
+
+static void corrupt_v2(void) {
+    unsigned char bytes[sizeof(golden)];
+    for (size_t i = 0; i < sizeof(golden); ++i) {
+        memcpy(bytes, golden, sizeof(bytes));
+        bytes[i] ^= 1;
+        fixture(path, bytes, sizeof(bytes));
+        CHECK(!dbce_open(path));
+        dbce_recovery_t report;
+        CHECK(!dbce_recover(path, NULL, &report));
+        CHECK(report.discarded_bytes == 0);
+        expect_file(path, bytes, sizeof(bytes));
+    }
+    /* Re-seal the header after changing empty SET to DELETE. The independent
+       record CRC must still reject these otherwise valid metadata. */
+    memcpy(bytes, golden, sizeof(bytes));
+    bytes[44 + 4] = OP_DELETE;
+    uint32_t header_crc = dbce_crc32_update(0, bytes + 44, 20);
+    for (unsigned i = 0; i < 4; ++i) bytes[44 + 20 + i] = (unsigned char)(header_crc >> (8*i));
+    fixture(path, bytes, sizeof(bytes));
+    FAILS(dbce_open(path), EBADMSG);
+    char dest[1024];
+    temp_file(dest, sizeof(dest));
+    CHECK(!remove(dest));
+    dbce_recovery_t damaged;
+    FAILS(dbce_recover(path, dest, &damaged), EBADMSG);
+    CHECK(damaged.issue == DBCE_ISSUE_RECORD_CRC && damaged.verified_bytes == 44);
+    CHECK(!fopen(dest, "rb") && errno == ENOENT);
+    for (size_t n = 1; n < V2_FILE_BYTES; ++n) {
+        fixture(path, golden, n);
+        FAILS(dbce_open(path), EILSEQ);
+    }
+    fixture(path, golden, sizeof(golden));
+    dbce_recovery_t report;
+    CHECK(dbce_recover(path, NULL, &report) && !report.discarded_bytes);
+}
+
+static void truncated_v2(void) {
+    unsigned char bytes[72];
+    memcpy(bytes, golden, 44);
+    memcpy(bytes+44, golden+16, 28);
+    char dest[1024], backup[1040];
+    temp_file(dest, sizeof(dest));
+    CHECK(!remove(dest));
+    snprintf(backup, sizeof(backup), "%s.bak", dest);
+    for (size_t cut = 1; cut < 28; ++cut) {
+        fixture(path, bytes, 44 + cut);
+        FAILS(dbce_open(path), EILSEQ);
+        dbce_recovery_t report;
+        CHECK(dbce_recover(path, NULL, &report) && report.discarded_bytes == cut);
+        CHECK(report.tail == (cut < 24 ? DBCE_TAIL_HEADER : cut == 24 ? DBCE_TAIL_KEY : DBCE_TAIL_VALUE));
+        CHECK(dbce_recover(path, dest, &report));
+        expect_file(dest, bytes, 44);
+        expect_file(backup, bytes, 44 + cut);
+        expect_file(path, bytes, 44 + cut);
+        FAILS(dbce_recover(path, dest, &report), EEXIST);
+        CHECK(!remove(dest));
+        FAILS(dbce_recover(path, dest, &report), EEXIST);
+        expect_file(backup, bytes, 44 + cut);
+        CHECK(!remove(backup));
+    }
+    bytes[44] ^= 1;
+    fixture(path, bytes, 45);
+    dbce_recovery_t report;
+    FAILS(dbce_recover(path, dest, &report), EILSEQ);
+}
+
+static int migration_failure;
+static bool exit_during_migration;
+int dbce_test_migration_header(void) {
+    if (exit_during_migration) _Exit(86);
+    return migration_failure;
+}
+static void migrate_v1(void) {
+    FILE* fp = fopen(path, "wb");
+    CHECK(fp);
+    record(fp, "a", "old");
+    record(fp, "a", "new");
+    record(fp, "b", "");
+    CHECK(!fclose(fp));
+    unsigned char binary[] = {0, 4, 0, 255};
+    dbce_t* db = open_temp();
+    CHECK(dbce_set(db, "c", binary, sizeof(binary)));
+    CHECK(dbce_close_checked(db));
+    unsigned char before[128];
+    fp = fopen(path, "rb");
+    CHECK(fp);
+    size_t n = fread(before, 1, sizeof(before), fp);
+    CHECK(n < sizeof(before) && !ferror(fp) && !fclose(fp));
+    char dest[1024];
+    temp_file(dest, sizeof(dest));
+    FAILS(dbce_migrate(path, path), EEXIST);
+    FAILS(dbce_migrate(path, dest), EEXIST);
+    expect_file(dest, before, 0);
+    CHECK(!remove(dest));
+    migration_failure = ENOSPC;
+    FAILS(dbce_migrate(path, dest), ENOSPC);
+    migration_failure = 0;
+    CHECK(dbce_migrate(path, dest)); /* No leftover destination after failure. */
+    expect_file(path, before, n);
+    db = dbce_open(dest);
+    CHECK(db && db->v2);
+    expect_value(db, "a", "new", 3);
+    expect_value(db, "c", binary, sizeof(binary));
+    missing(db, "b");
+    CHECK(dbce_close_checked(db));
+    fp = fopen(dest, "rb");
+    CHECK(fp && !fseek(fp, 0, SEEK_END));
+    CHECK(ftell(fp) == 16 + 4*24 + 4 + 3 + 3 + 4); /* History and tombstone retained. */
+    CHECK(!fclose(fp) && !remove(dest));
+#ifndef _WIN32
+    CHECK(!link(path, dest));
+    FAILS(dbce_migrate(path, dest), EEXIST);
+    CHECK(!remove(dest));
+#endif
+}
+
+#ifndef _WIN32
+static void interrupted_migration(void) {
+    FILE* fp = fopen(path, "wb");
+    CHECK(fp);
+    record(fp, "key", "value");
+    CHECK(!fclose(fp));
+    char dir[1200], dest[1250];
+    snprintf(dir, sizeof(dir), "%s.XXXXXX", path);
+    CHECK(mkdtemp(dir));
+    snprintf(dest, sizeof(dest), "%s/new", dir);
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (!pid) {
+        exit_during_migration = true;
+        (void)dbce_migrate(path, dest);
+        _Exit(99);
+    }
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 86);
+    CHECK(access(dest, F_OK) == -1 && errno == ENOENT);
+    CHECK(dbce_migrate(path, dest)); /* The killed process no longer owns the lock. */
+    dbce_t* db = dbce_open(dest);
+    CHECK(db);
+    expect_value(db, "key", "value", 5);
+    CHECK(dbce_close_checked(db) && !remove(dest));
+    DIR* d = opendir(dir);
+    CHECK(d);
+    struct dirent* item;
+    while ((item = readdir(d))) {
+        if (!strncmp(item->d_name, "new.tmp.", 8)) CHECK(!unlinkat(dirfd(d), item->d_name, 0));
+    }
+    CHECK(!closedir(d) && !rmdir(dir));
+}
+#endif
+
+static void durable_failure(void) {
+    CHECK(!remove(path));
+    dbce_t* db = open_temp();
+    CHECK(dbce_set_async(db, "key", "v", 1));
+    sync_failure = EIO;
+    FAILS(dbce_sync_durable(db), EIO);
+    sync_failure = 0;
+    FAILS(dbce_sync_durable(db), EIO);
+    expect_value(db, "key", "v", 1);
+    FAILS(dbce_close_checked(db), EIO);
+}
+
+static void scan_failure(void) {
+    CHECK(!remove(path));
+    dbce_t* db = open_temp();
+    header_error = ENOSPC;
+    CHECK(dbce_set_async(db, "e", NULL, 0));
+    int seen = 0;
+    FAILS(dbce_scan_all_checked(db, empty_row, &seen), ENOSPC);
+    CHECK(!seen);
+    FAILS(dbce_close_checked(db), ENOSPC);
+    header_error = 0;
+}
+
+static const char* executable;
+static int child_probe(void) {
+#ifdef _WIN32
+    char quoted[sizeof(path)+3];
+    snprintf(quoted, sizeof(quoted), "\"%s\"", path);
+    return (int)_spawnl(_P_WAIT, executable, "dbce_tests", "--probe", quoted, (char*)NULL);
+#else
+    pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (!pid) { execl(executable, executable, "--probe", path, (char*)NULL); _exit(99); }
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status));
+    return WEXITSTATUS(status);
+#endif
+}
+
+static void exclusive(void) {
+    CHECK(!remove(path));
+    dbce_t* db = open_temp();
+    FAILS(dbce_open(path), EBUSY);
+    CHECK(child_probe() == 23);
+    CHECK(dbce_close_checked(db));
+    CHECK(child_probe() == 0);
+}
+
+static void v2_capacity(void) {
+    CHECK(!remove(path));
+    dbce_t* db = open_temp();
+    char key[16];
+    for (unsigned i = 0; i < DBCE_INDEX_CAPACITY; ++i) {
+        snprintf(key, sizeof(key), "k%u", i);
+        CHECK(dbce_set(db, key, NULL, 0));
+    }
+    FAILS(dbce_set(db, "extra", NULL, 0), ENOSPC);
+    CHECK(dbce_set(db, "k0", "v", 1));
+    FAILS(dbce_close_checked(db), ENOSPC);
+    db = open_temp();
+    expect_value(db, "k0", "v", 1);
+    missing(db, "extra");
+    CHECK(dbce_close_checked(db));
+}
+
+static void v2_concurrent(void) {
+    CHECK(!remove(path));
+    run_threads(produce);
+    run_threads(contend);
+}
+int main(int argc, char** argv) {
+    executable = argv[0];
+    if (argc == 3 && !strcmp(argv[1], "--probe")) {
+        dbce_t* db = dbce_open(argv[2]);
+        if (!db) return errno == EBUSY ? 23 : 24;
+        return dbce_close_checked(db) ? 0 : 25;
+    }
     struct { const char* name; void (*run)(void); } cases[] = {
+        {"V2 golden wire, CRC vectors, empty and delete", wire},
+        {"V2 bit flips and invalid headers", corrupt_v2}, {"V2 tail recovery and backup", truncated_v2},
+        {"V1 migration, failure and collisions", migrate_v1}, {"durability failure", durable_failure},
+        {"checked scan after async failure", scan_failure}, {"multi-process locking", exclusive},
+        {"V2 concurrent readers and producers", v2_concurrent}, {"V2 capacity", v2_capacity},
         {"set/get/delete/reopen", round_trip}, {"binary + async copy", binary},
         {"key/value limits + empty values", validation}, {"in-flight fence + queue full", completion},
         {"multiple producers + read after write", producers}, {"concurrent readers/writer", readers},
         {"worker init + allocation overflow", init_failure}, {"failed delete + sealed tail", partial_write},
 #ifndef _WIN32
-        {"OS short write", file_limit},
+        {"OS short write", file_limit}, {"process exit during migration", interrupted_migration},
 #if SIZE_MAX > UINT32_MAX
         {"64-bit sparse offsets", sparse_offsets},
 #endif

@@ -24,6 +24,22 @@ typedef struct {
     uint32_t sync_interval_ms;
 } dbce_config_t;
 
+typedef enum { DBCE_TAIL_NONE, DBCE_TAIL_HEADER, DBCE_TAIL_KEY, DBCE_TAIL_VALUE } dbce_tail_t;
+typedef enum {
+    DBCE_ISSUE_NONE, DBCE_ISSUE_FILE_HEADER, DBCE_ISSUE_MAGIC, DBCE_ISSUE_VERSION,
+    DBCE_ISSUE_OPERATION, DBCE_ISSUE_FIELDS, DBCE_ISSUE_LENGTH, DBCE_ISSUE_KEY,
+    DBCE_ISSUE_HEADER_CRC, DBCE_ISSUE_RECORD_CRC
+} dbce_issue_t;
+typedef struct {
+    dbce_tail_t tail;
+    dbce_issue_t issue;
+    uint64_t verified_bytes, discarded_bytes;
+} dbce_recovery_t;
+
+/* NULL destination inspects. Recovery creates destination plus destination.bak. */
+bool dbce_recover(const char* source, const char* destination, dbce_recovery_t* report);
+bool dbce_migrate(const char* source, const char* destination);
+
 typedef struct dbce_engine dbce_t;
 typedef void (*dbce_scan_cb)(const char* key, const void* val, size_t val_len, void* udata);
 
@@ -42,6 +58,8 @@ bool dbce_del(dbce_t* db, const char* key);
 /* Cumulative from open through the submission sequence captured at entry. */
 bool dbce_sync_wait_checked(dbce_t* db);
 void dbce_sync_wait(dbce_t* db);
+/* Checked completion followed by an OS file synchronization. */
+bool dbce_sync_durable(dbce_t* db);
 /* Snapshot callbacks may re-enter the engine and borrow key/value until return. */
 bool dbce_scan_all_checked(dbce_t* db, dbce_scan_cb cb, void* udata);
 void dbce_scan_all(dbce_t* db, dbce_scan_cb cb, void* udata);

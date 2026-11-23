@@ -9,17 +9,26 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
 
-add_library(dbce_engine STATIC dbce.c)
+set(storage_sources storage_io.c storage_format.c maintenance.c)
+add_library(dbce_engine STATIC dbce.c ${storage_sources})
 target_link_libraries(dbce_engine PUBLIC Threads::Threads)
 add_executable(dbce main.c)
 target_link_libraries(dbce PRIVATE dbce_engine)
 
 include(CTest)
 if(BUILD_TESTING)
-    add_executable(dbce_tests test_dbce.c)
+    add_executable(dbce_tests test_dbce.c ${storage_sources})
+    target_compile_definitions(dbce_tests PRIVATE DBCE_TESTING)
     target_link_libraries(dbce_tests PRIVATE Threads::Threads)
     add_test(NAME engine COMMAND dbce_tests)
     add_test(NAME cli COMMAND ${CMAKE_COMMAND} -DCLI=$<TARGET_FILE:dbce>
              -P ${CMAKE_CURRENT_SOURCE_DIR}/test_cli.cmake)
     set_tests_properties(engine cli PROPERTIES TIMEOUT 120)
+endif()
+
+
+if(UNIX AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(dbce_bench EXCLUDE_FROM_ALL bench_dbce.c)
+    target_include_directories(dbce_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(dbce_bench PRIVATE dbce_engine)
 endif()

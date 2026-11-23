@@ -60,19 +60,32 @@ Include [dbce.h](dbce.h) and link the CMake target `dbce_engine`. Open a file wi
 | `dbce_set`, `dbce_del` | Success means the worker wrote the complete record, flushed the stream, and updated the index. Deleting an absent key also writes a tombstone. |
 | `dbce_set_async` | Copies the input and returns when the queue accepts it. A full queue returns `false` with `errno == EAGAIN`. |
 | `dbce_sync_wait_checked` | Waits for writes submitted through the start of the call. It reports the first accepted write that failed in that range since open. Later barriers continue to report it. |
+| `dbce_sync_durable` | Waits for checked completion, then calls `fsync` on Linux or `FlushFileBuffers` on Windows. Call once per batch or once per write. A failed durable sync is remembered until close. |
 | `dbce_get` | Returns a caller-owned buffer and its byte length. Read binary data using that length and release the buffer with `free()`. A missing key sets `errno` to `ENOENT`. |
-| `dbce_scan_all_checked` | Visits a snapshot. Callbacks can read or write through the same handle. A scan can report a read or allocation error after earlier callbacks have run. |
+| `dbce_scan_all_checked` | Propagates earlier accepted write failures before visiting a snapshot. Callbacks can read or write through the same handle. A scan can report a read or allocation error after earlier callbacks have run. |
 | `dbce_close_checked` | Drains accepted writes, joins the worker, and reports write or close errors. Finish other calls and callbacks before closing. |
 
 Use one open handle per file across all processes. Threads can share that handle. The queue mutex protects admission and completion. A separate mutex protects the file and index. The worker releases the storage mutex before announcing completion, and scans invoke callbacks with both mutexes released. Failed calls returning a pointer or boolean set `errno` on the calling thread.
 
-### File limits and recovery
+### Storage formats and maintenance
 
-- Keys are C strings of 1–63 bytes. Values contain at least one byte and must fit both a `uint32_t` length and a `size_t` allocation with room for a trailing NUL on read. A zero length on disk denotes deletion.
-- The index holds 4096 distinct keys, including deleted keys. At capacity, existing keys can still be updated. Adding another distinct key fails with `ENOSPC`.
-- The legacy header contains four native-endian 32-bit fields in order: magic, reserved CRC, key length, value length. Raw key bytes (without a NUL) and value bytes follow. New records retain a zero CRC. Compatible legacy files open without migration.
-- Open validates record boundaries. A malformed file or incomplete tail fails with `EILSEQ`; the file stays intact. Preserve a copy for manual recovery or restore a known-good backup. An append I/O error stops further writes on that handle.
-- A successful write flushes data to the operating system. Power loss can still lose acknowledged data. The format has no verified checksum or commit marker, so a same-length corruption can go undetected and a complete record from a failed write can appear after reopening.
+A new pathname creates V2. Existing V1 files, including zero-byte files, keep their original format on read and write. Both formats support 1–63 byte keys and 4096 distinct keys including tombstones. A value must fit a 32-bit length and leave room for a trailing NUL in the caller’s buffer. In V2, `dbce_set(db, key, NULL, 0)` stores an empty value. Get returns an allocated buffer of length zero, and scans include it. V1 reserves zero length for deletion.
+
+V2 uses little-endian fields and verifies CRC-32/ISO-HDLC over the record metadata, key and value on open. A second CRC checks the header before recovery uses its lengths. V1 has structural validation only. See the [binary specification](docs/FILE_FORMAT.md).
+
+Maintenance commands take literal paths, including the extension. Close the database first.
+
+```sh
+dbce migrate old.dbce new.dbce
+dbce recover damaged.dbce
+dbce recover damaged.dbce restored.dbce
+```
+
+Migration preserves the ordered history, checks the output against the source record by record, and publishes a new file. The first recovery command reports which part of the final V2 record is missing and how many bytes would be discarded. The second publishes the verified prefix as `restored.dbce` and the complete original bytes as `restored.dbce.bak`. Both names must be unused. Source files stay intact. A bad checksum, malformed metadata, or unsupported version fails recovery. A clean file has zero bytes to discard.
+
+DBCE holds an OS lock until close. Another DBCE handle, including one in a different process, receives `EBUSY`. Use local filesystems that implement these locks and keep file paths under application control. Older binaries and external editors can bypass the locking protocol. CRCs are verified during opening and maintenance. Ordinary gets use the validated index.
+
+Ordinary writes flush to the OS. Call `dbce_sync_durable` when a batch needs a storage barrier. Physical persistence depends on the filesystem, device and its write cache. An incomplete or complete unacknowledged last record is possible after interruption. See [platform publication limits](docs/FILE_FORMAT.md#publication-and-crash-boundaries) and [benchmark results](docs/BENCHMARK.md).
 
 ## Türkçe
 
@@ -132,16 +145,29 @@ Bu örnekte silme işleminden sonra `get table` sıfır etkin kayıt gösterir. 
 | `dbce_set`, `dbce_del` | Kayıt tamamen yazıldıktan, akış işletim sistemine aktarıldıktan ve indeks güncellendikten sonra başarı döner. Bulunmayan bir anahtar için de silme kaydı yazılır. |
 | `dbce_set_async` | Girdiyi kopyalar. Başarı, kuyruğun yazma isteğini kabul ettiğini gösterir. Kuyruk doluysa `false` döner ve `errno` değeri `EAGAIN` olur. |
 | `dbce_sync_wait_checked` | Çağrı başladığında kuyruğa alınmış yazmaların tamamlanmasını bekler. Dosya açıldığından beri bu kapsamdaki ilk yazma hatasını bildirir. Sonraki bekleme çağrıları da aynı hatayı bildirir. |
+| `dbce_sync_durable` | Yazmaların sonucunu denetler, ardından Linux’ta `fsync`, Windows’ta `FlushFileBuffers` çağırır. Her yazmadan veya bir grup yazmadan sonra çağrılabilir. Eşitleme hatası kapatılana kadar saklanır. |
 | `dbce_get` | Değeri ve bayt uzunluğunu döndürür. İkili veriyi bu uzunlukla okuyun ve belleği `free()` ile serbest bırakın. Anahtar bulunamazsa `errno` değeri `ENOENT` olur. |
-| `dbce_scan_all_checked` | Tarama başındaki kayıtları dolaşır. Geri çağırım aynı veritabanından okuyabilir veya ona yazabilir. Bazı kayıtlar işlendikten sonra okuma ya da bellek ayırma hatası oluşabilir. |
+| `dbce_scan_all_checked` | Önce kabul edilmiş yazmaların hatalarını bildirir. Başarılıysa tarama başındaki kayıtları dolaşır. Geri çağırım aynı veritabanından okuyabilir veya ona yazabilir. Bazı kayıtlar işlendikten sonra okuma ya da bellek ayırma hatası oluşabilir. |
 | `dbce_close_checked` | Kabul edilen yazmaları tamamlar, yazıcı iş parçacığının bitmesini bekler ve yazma veya kapatma hatalarını bildirir. Kapatmadan önce diğer çağrıların ve geri çağırımların bitmesini bekleyin. |
 
 Her dosya için tüm süreçler genelinde tek bir açık veritabanı tanıtıcısı kullanın. İş parçacıkları bu tanıtıcıyı paylaşabilir. Kuyruk kilidi isteklerin kabulünü ve tamamlanmasını, ayrı bir kilit de dosyayı ve indeksi korur. Yazıcı tamamlanmayı bildirmeden önce dosya kilidini bırakır. Tarama geri çağırımları iki kilit de serbestken çalışır. İşaretçi veya mantıksal değer döndüren çağrılarda hata nedenini aynı iş parçacığında `errno` üzerinden okuyabilirsiniz.
 
-### Dosya sınırları ve kurtarma
+### Dosya biçimleri ve bakım
 
-- Anahtarlar 1–63 baytlık C dizgeleridir. Değer en az bir bayt içermeli, uzunluğu `uint32_t` türüne sığmalı ve okuma sırasında sonlandırıcı NUL için ayrılan ek baytla birlikte `size_t` sınırını aşmamalıdır. Dosyada sıfır uzunluk silme anlamına gelir.
-- İndeks, silinenler dahil 4096 farklı anahtar tutar. Sınırda mevcut anahtarlar güncellenebilir. Yeni bir anahtar eklemek `ENOSPC` hatası verir.
-- Eski biçimin başlığında makinenin bayt sırasıyla yazılmış dört adet 32 bit alan bulunur: biçim imzası, ayrılmış CRC alanı, anahtar uzunluğu ve değer uzunluğu. Ardından sonlandırıcı NUL içermeyen anahtar ve ham değer gelir. Yeni kayıtlarda CRC sıfırdır. Uyumlu eski dosyalar dönüştürülmeden açılır.
-- Açılışta kayıt sınırları denetlenir. Bozuk kayıt veya yarım kalmış son kayıt `EILSEQ` hatası verir. Dosya olduğu gibi korunur. Elle kurtarma için bir kopya alın veya sağlam bir yedeği geri yükleyin. Sona ekleme sırasında bir G/Ç hatası oluşursa o tanıtıcı üzerinden yeni yazmalar durur.
-- Başarılı yazma, verinin işletim sistemine aktarıldığını gösterir. Güç kesintisinde onaylanmış veri kaybolabilir. Biçimde doğrulanan bir sağlama toplamı veya işlemin tamamlandığını gösteren bir işaret yoktur. Bu nedenle uzunluğu değişmeyen bir bozulma fark edilmeyebilir. Hata bildirilmiş olsa bile dosyaya tam yazılmış bir kayıt yeniden açılışta görünebilir.
+Yeni bir dosya yolunda V2 oluşturulur. Sıfır baytlık olanlar dahil mevcut V1 dosyaları açıldığında ve yazıldığında V1 biçimini korur. İki biçimde de anahtar uzunluğu 1–63 bayttır. İndeks silinenler dahil 4096 farklı anahtar tutar. Değer uzunluğu 32 bite sığmalı ve okuma tamponunda sonlandırıcı NUL için yer kalmalıdır. V2’de `dbce_set(db, key, NULL, 0)` boş bir değer kaydeder. Okuma, uzunluğu sıfır olan ayrılmış bir tampon döndürür ve tarama bu kaydı içerir. V1’de sıfır uzunluk silme anlamına gelir.
+
+V2 alanları küçük sonlu bayt sırasıyla yazar. Açılışta kayıt bilgileri, anahtar ve değer üzerinde CRC-32/ISO-HDLC doğrulanır. İkinci bir CRC, kurtarmada uzunluklar kullanılmadan önce kayıt başlığını denetler. V1’de yalnızca dosya yapısı denetlenebilir. [İkili biçim tanımı](docs/FILE_FORMAT.md)
+
+Bakım komutları uzantı dahil tam dosya adını alır. Önce veritabanını kapatın.
+
+```sh
+dbce migrate eski.dbce yeni.dbce
+dbce recover hasarli.dbce
+dbce recover hasarli.dbce kurtarilan.dbce
+```
+
+Göç işlemi geçmişi sırasıyla aktarır, her çıktı kaydını kaynakla karşılaştırır ve yeni dosyayı yayımlar. İlk kurtarma komutu, son V2 kaydının hangi kısmının eksik olduğunu ve kaç baytın atılacağını gösterir. İkinci komut doğrulanmış kayıtları `kurtarilan.dbce` dosyasına, kaynağın bütün baytlarını da `kurtarilan.dbce.bak` dosyasına yazar. İki dosya adı da boşta olmalıdır. Kaynak korunur. Sağlama toplamı hatası, geçersiz kayıt bilgisi veya desteklenmeyen sürüm kurtarmayı durdurur. Sağlam dosyada atılacak bayt sayısı sıfırdır.
+
+DBCE, dosya kapanana kadar işletim sistemi kilidini tutar. Aynı dosyayı ikinci kez açmaya çalışan DBCE tanıtıcısı, başka bir süreçte olsa da `EBUSY` alır. Bu kilitleri destekleyen yerel bir dosya sistemi kullanın. Eski sürümler ve harici düzenleyiciler kilit protokolünü atlayabilir. CRC denetimi açılışta ve bakımda yapılır. Normal okumalar doğrulanmış indeksi kullanır.
+
+Normal yazmalar veriyi işletim sistemine aktarır. Bir grup yazmayı depolama aygıtıyla eşitlemek için `dbce_sync_durable` çağırın. Güç kesintisindeki sonuç dosya sistemine, aygıta ve yazma önbelleğine bağlıdır. Kesintiden sonra son kayıt yarım kalabilir veya onay alınmadığı halde tam olarak bulunabilir. [Platform sınırları](docs/FILE_FORMAT.md#publication-and-crash-boundaries) · [Performans ölçümleri](docs/BENCHMARK.md)
