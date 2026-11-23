@@ -3,6 +3,8 @@
 #include "string.h"
 #include "stdbool.h"
 #include "dbce.h"
+#include <ctype.h>
+#include <errno.h>
 
 #ifdef _WIN32
 #include "windows.h"
@@ -115,7 +117,7 @@ static void clear_screen() {
 #endif
 }
 
-static void list_databases() {
+static bool list_databases(void) {
     if (current_lang == LANG_TR) {
         printf("[+] Mevcut DBCE Veritabanlari:\n");
     } else {
@@ -128,22 +130,34 @@ static void list_databases() {
         do {
             printf("  - %s\n", fd.cFileName);
         } while (FindNextFileA(h, &fd));
-        FindClose(h);
+        DWORD error = GetLastError();
+        if (!FindClose(h) || error != ERROR_NO_MORE_FILES) {
+            errno = EIO;
+            return false;
+        }
     } else {
+        if (GetLastError() != ERROR_FILE_NOT_FOUND) { errno = EIO; return false; }
         printf("  (Hic veritabani bulunamadi)\n");
     }
 #else
     DIR* d = opendir(".");
-    if (d) {
+    if (!d) return false;
+    {
         struct dirent* dir;
-        while ((dir = readdir(d)) != NULL) {
+        for (;;) {
+            errno = 0;
+            dir = readdir(d);
+            if (!dir) break;
             if (strstr(dir->d_name, ".dbce")) {
                 printf("  - %s\n", dir->d_name);
             }
         }
-        closedir(d);
+        int error = errno;
+        if (closedir(d) != 0) return false;
+        if (error) { errno = error; return false; }
     }
 #endif
+    return true;
 }
 
 typedef struct {
@@ -165,13 +179,13 @@ static void render_single_table(const char* key, const char* val) {
     printf("+----------------------+----------------------------------------------------+\n");
 }
 
-static void render_table(dbce_t* db) {
+static bool render_table(dbce_t* db) {
     printf("+----------------------+----------------------------------------------------+\n");
     printf("| %-20s | %-50s |\n", "KEY", "VALUE");
     printf("+----------------------+----------------------------------------------------+\n");
 
     table_ctx_t ctx = { .count = 0 };
-    dbce_scan_all(db, print_table_row, &ctx);
+    if (!dbce_scan_all_checked(db, print_table_row, &ctx)) return false;
 
     printf("+----------------------+----------------------------------------------------+\n");
     if (current_lang == LANG_TR) {
@@ -179,26 +193,67 @@ static void render_table(dbce_t* db) {
     } else {
         printf("[+] Total active records: %llu\n", (unsigned long long)ctx.count);
     }
+    return true;
 }
 
-static void run_repl(const char* db_file) {
-    char target[256];
-    if (strstr(db_file, ".dbce")) {
-        strncpy(target, db_file, sizeof(target) - 1);
-    } else {
-        snprintf(target, sizeof(target), "%s.dbce", db_file);
-    }
+static bool db_path(const char* name, char target[256]) {
+    size_t len = strlen(name);
+    if (!len) { errno = EINVAL; return false; }
+    bool suffix = len >= 5 && strcmp(name + len - 5, ".dbce") == 0;
+    if (len >= 256u - (suffix ? 0u : 5u)) { errno = ENAMETOOLONG; return false; }
+    strcpy(target, name);
+    if (!suffix) strcat(target, ".dbce");
+    return true;
+}
 
-    dbce_t* db = dbce_open(target);
-    if (!db) {
-        if (current_lang == LANG_TR) {
-            printf("[-] Veritabani acilamadi: %s\n", target);
-        } else {
-            printf("[-] Failed to open database: %s\n", target);
-        }
+static void report_error(const char* operation, const char* key) {
+    const char* message;
+    switch (errno) {
+    case ENOENT:
+        if (!key) { perror(operation); return; }
+        fprintf(stderr, "%s: %s (%s)\n", operation,
+                current_lang == LANG_TR ? "Anahtar bulunamadi" : "Key not found", key);
+        return;
+    case EILSEQ:
+        message = current_lang == LANG_TR ? "Gecersiz veya eksik DBCE kaydi" :
+                                           "Invalid or incomplete DBCE record";
+        break;
+    case ENOSPC:
+        message = current_lang == LANG_TR ? "Indeks veya disk dolu" :
+                                           "Index capacity or storage exhausted";
+        break;
+    default:
+        perror(operation);
         return;
     }
+    fprintf(stderr, "%s: %s\n", operation, message);
+}
 
+static bool show_value(dbce_t* db, const char* key) {
+    if (strcmp(key, "table") == 0) return render_table(db);
+    void* data;
+    size_t len;
+    if (!dbce_get(db, key, &data, &len)) return false;
+    render_single_table(key, data);
+    free(data);
+    return true;
+}
+
+static char* skip_spaces(char* p) {
+    while (isspace((unsigned char)*p)) ++p;
+    return p;
+}
+
+static char* next_token(char** cursor) {
+    char* token = skip_spaces(*cursor);
+    char* p = token;
+    while (*p && !isspace((unsigned char)*p)) ++p;
+    if (*p) *p++ = '\0';
+    *cursor = p;
+    return token;
+}
+
+static bool run_repl(dbce_t* db, const char* target) {
     if (current_lang == LANG_TR) {
         printf("[+] DBCE Shell Baglandi: %s\n", target);
         printf("[i] Komutlar: add [key] [val] | get [key] | get table | del [key] | help | cls | exit\n");
@@ -207,160 +262,90 @@ static void run_repl(const char* db_file) {
         printf("[i] Commands: add [key] [val] | get [key] | get table | del [key] | help | cls | exit\n");
     }
 
+    bool ok = true;
     char line[512];
-    while (1) {
+    for (;;) {
         printf("dbce(%s)> ", target);
         if (!fgets(line, sizeof(line), stdin)) break;
-
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
-        if (strlen(line) == 0) continue;
-
-        char cmd[32] = {0};
-        char arg1[128] = {0};
-        char arg2[256] = {0};
-
-        int parsed = sscanf(line, "%31s %127s %255[^\n]", cmd, arg1, arg2);
-
-        if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) {
-            break;
-        } else if (strcmp(cmd, "help") == 0) {
-            show_shell_help();
-        } else if (strcmp(cmd, "clear") == 0 || strcmp(cmd, "cls") == 0) {
-            clear_screen();
-        } else if (strcmp(cmd, "add") == 0) {
-            if (parsed < 3) {
-                printf(current_lang == LANG_TR ? "[-] Kullanim: add [key] [val]\n" : "[-] Usage: add [key] [val]\n");
-            } else {
-                dbce_set(db, arg1, arg2, strlen(arg2));
-                printf("[OK] %s -> %s\n", current_lang == LANG_TR ? "Eklendi" : "Added", arg1);
+        char* newline = strchr(line, '\n');
+        if (newline) *newline = '\0';
+        else {
+            int ch = getchar();
+            if (ch != EOF && ch != '\n') {
+                while (ch != EOF && ch != '\n') ch = getchar();
+                fprintf(stderr, "[-] %s\n", current_lang == LANG_TR ? "Komut cok uzun." : "Command too long.");
+                ok = false;
+                continue;
             }
-        } else if (strcmp(cmd, "get") == 0) {
-            if (parsed < 2) {
-                printf(current_lang == LANG_TR ? "[-] Kullanim: get [key] veya get table\n" : "[-] Usage: get [key] or get table\n");
-            } else if (strcmp(arg1, "table") == 0) {
-                render_table(db);
-            } else {
-                void* data = NULL;
-                size_t out_len = 0;
-                if (dbce_get(db, arg1, &data, &out_len)) {
-                    render_single_table(arg1, (char*)data);
-                    free(data);
-                } else {
-                    printf(current_lang == LANG_TR ? "[-] Bulunamadi: %s\n" : "[-] Not found: %s\n", arg1);
-                }
-            }
-        } else if (strcmp(cmd, "del") == 0) {
-            if (parsed < 2) {
-                printf(current_lang == LANG_TR ? "[-] Kullanim: del [key]\n" : "[-] Usage: del [key]\n");
-            } else {
-                if (dbce_del(db, arg1)) {
-                    printf("[OK] %s: %s\n", current_lang == LANG_TR ? "Silindi" : "Deleted", arg1);
-                } else {
-                    printf(current_lang == LANG_TR ? "[-] Kayit bulunamadi: %s\n" : "[-] Record not found: %s\n", arg1);
-                }
-            }
-        } else {
-            printf(current_lang == LANG_TR ? "[-] Bilinmeyen komut: %s. 'help' yazabilirsiniz.\n" : "[-] Unknown command: %s. Type 'help'.\n", cmd);
         }
+        char* cursor = line;
+        char* cmd = next_token(&cursor);
+        char* key = next_token(&cursor);
+        char* value = skip_spaces(cursor);
+        if (!*cmd) continue;
+        if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0) break;
+        if (strcmp(cmd, "help") == 0) { show_shell_help(); continue; }
+        if (strcmp(cmd, "cls") == 0 || strcmp(cmd, "clear") == 0) { clear_screen(); continue; }
+        bool success;
+        if (strcmp(cmd, "add") == 0) {
+            success = dbce_set(db, key, value, strlen(value));
+            if (success) printf("[OK] %s -> %s\n", current_lang == LANG_TR ? "Eklendi" : "Added", key);
+        } else if (strcmp(cmd, "get") == 0) {
+            success = show_value(db, key);
+        } else if (strcmp(cmd, "del") == 0) {
+            success = dbce_del(db, key);
+            if (success) printf("[OK] %s: %s\n", current_lang == LANG_TR ? "Silindi" : "Deleted", key);
+        } else {
+            show_shell_help();
+            ok = false;
+            continue;
+        }
+        if (!success) { report_error(cmd, key); ok = false; }
     }
-
-    dbce_close(db);
+    if (ferror(stdin)) { perror("stdin"); ok = false; }
     printf(current_lang == LANG_TR ? "[+] Shell kapatildi.\n" : "[+] Shell closed.\n");
+    return ok;
 }
 
 int main(int argc, char* argv[]) {
     setup_console_utf8();
     load_lang_config();
-
-    if (argc < 2) {
+    if (argc < 2 || strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 ||
+        strcmp(argv[1], "-h") == 0) {
         show_cli_help();
         return 0;
     }
 
-    if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
-        show_cli_help();
-        return 0;
+    const char* cmd = argv[1];
+    if (argc >= 3 && strcmp(cmd, "db") == 0 && strcmp(argv[2], "list") == 0) {
+        if (list_databases()) return 0;
+        perror("db list");
+        return 1;
     }
+    bool create = argc >= 4 && strcmp(cmd, "create") == 0 && strcmp(argv[2], "db") == 0;
+    bool repl = argc >= 3 && strcmp(cmd, "go") == 0;
+    bool add = argc >= 5 && strcmp(cmd, "add") == 0;
+    bool get = argc >= 4 && strcmp(cmd, "get") == 0;
+    bool del = argc >= 4 && strcmp(cmd, "del") == 0;
+    if (!(create || repl || add || get || del)) { show_cli_help(); return 1; }
+    char target[256];
+    if (!db_path(argv[create ? 3 : 2], target)) { perror(cmd); return 1; }
+    dbce_t* db = dbce_open(target);
+    if (!db) { report_error(target, NULL); return 1; }
 
-    if (strcmp(argv[1], "create") == 0 && argc >= 4 && strcmp(argv[2], "db") == 0) {
-        char db_name[256];
-        snprintf(db_name, sizeof(db_name), "%s.dbce", argv[3]);
-        FILE* f = fopen(db_name, "a+b");
-        if (f) {
-            fclose(f);
-            printf("[OK] %s veritabani olusturuldu.\n", db_name);
-        } else {
-            printf("[-] Veritabani olusturulamadi.\n");
-        }
-        return 0;
+    bool ok = true;
+    if (repl) ok = run_repl(db, target);
+    else if (add) ok = dbce_set(db, argv[3], argv[4], strlen(argv[4]));
+    else if (get) ok = show_value(db, argv[3]);
+    else if (del) ok = dbce_del(db, argv[3]);
+    if (!ok && !repl) report_error(cmd, argv[3]);
+    if (!dbce_close_checked(db)) {
+        if (ok) report_error(target, NULL);
+        ok = false;
     }
-
-    if (strcmp(argv[1], "db") == 0 && argc >= 3 && strcmp(argv[2], "list") == 0) {
-        list_databases();
-        return 0;
-    }
-
-    if (strcmp(argv[1], "go") == 0 && argc >= 3) {
-        run_repl(argv[2]);
-        return 0;
-    }
-
-    if (strcmp(argv[1], "add") == 0 && argc >= 5) {
-        char target[256];
-        snprintf(target, sizeof(target), "%s%s", argv[2], strstr(argv[2], ".dbce") ? "" : ".dbce");
-        dbce_t* db = dbce_open(target);
-        if (!db) {
-            printf("[-] DB acilamadi.\n");
-            return 1;
-        }
-        dbce_set(db, argv[3], argv[4], strlen(argv[4]));
-        dbce_close(db);
-        printf("[OK] Kaydedildi.\n");
-        return 0;
-    }
-
-    if (strcmp(argv[1], "get") == 0 && argc >= 4) {
-        char target[256];
-        snprintf(target, sizeof(target), "%s%s", argv[2], strstr(argv[2], ".dbce") ? "" : ".dbce");
-        dbce_t* db = dbce_open(target);
-        if (!db) {
-            printf("[-] DB acilamadi.\n");
-            return 1;
-        }
-        if (strcmp(argv[3], "table") == 0) {
-            render_table(db);
-        } else {
-            void* data = NULL;
-            size_t len = 0;
-            if (dbce_get(db, argv[3], &data, &len)) {
-                render_single_table(argv[3], (char*)data);
-                free(data);
-            } else {
-                printf("[-] Bulunamadi.\n");
-            }
-        }
-        dbce_close(db);
-        return 0;
-    }
-
-    if (strcmp(argv[1], "del") == 0 && argc >= 4) {
-        char target[256];
-        snprintf(target, sizeof(target), "%s%s", argv[2], strstr(argv[2], ".dbce") ? "" : ".dbce");
-        dbce_t* db = dbce_open(target);
-        if (!db) {
-            printf("[-] DB acilamadi.\n");
-            return 1;
-        }
-        if (dbce_del(db, argv[3])) {
-            printf("[OK] Silindi.\n");
-        } else {
-            printf("[-] Bulunamadi.\n");
-        }
-        dbce_close(db);
-        return 0;
-    }
-
-    show_cli_help();
-    return 1;
+    if (!ok) return 1;
+    if (create) printf("[OK] %s veritabani olusturuldu.\n", target);
+    if (add) puts("[OK] Kaydedildi.");
+    if (del) puts("[OK] Silindi.");
+    return 0;
 }
